@@ -2,7 +2,9 @@ package nfs_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -172,7 +174,7 @@ func TestNFS(t *testing.T) {
 	}
 	defer mf.Close()
 	buf := make([]byte, len(b))
-	if _, err = mf.Read(buf[:]); err != nil {
+	if _, err = mf.Read(buf[:]); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(buf, b) {
@@ -374,4 +376,203 @@ func readDir(target *nfsc.Target, dir string) ([]*readDirEntry, error) {
 	}
 
 	return entries, nil
+}
+
+// nfsRead issues a raw NFS READ RPC and returns the count, eof flag, and data.
+func nfsRead(target *nfsc.Target, filePath string, offset uint64, count uint32) (uint32, bool, []byte, error) {
+	_, fh, err := target.Lookup(filePath)
+	if err != nil {
+		return 0, false, nil, err
+	}
+
+	type readArgs struct {
+		rpc.Header
+		Handle []byte
+		Offset uint64
+		Count  uint32
+	}
+
+	res, err := target.Call(&readArgs{
+		Header: rpc.Header{
+			Rpcvers: 2,
+			Vers:    nfsc.Nfs3Vers,
+			Prog:    nfsc.Nfs3Prog,
+			Proc:    uint32(nfs.NFSProcedureRead),
+			Cred:    rpc.AuthNull,
+			Verf:    rpc.AuthNull,
+		},
+		Handle: fh,
+		Offset: offset,
+		Count:  count,
+	})
+	if err != nil {
+		return 0, false, nil, err
+	}
+
+	status, err := xdr.ReadUint32(res)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if err = nfsc.NFS3Error(status); err != nil {
+		return 0, false, nil, err
+	}
+
+	// Read response using same structure as the NFS client
+	type readRes struct {
+		Attr  nfsc.PostOpAttr
+		Count uint32
+		EOF   uint32
+		Data  struct {
+			Length uint32
+		}
+	}
+	var readResp readRes
+	if err = xdr.Read(res, &readResp); err != nil {
+		return 0, false, nil, err
+	}
+	data := make([]byte, readResp.Data.Length)
+	if readResp.Data.Length > 0 {
+		if _, err = io.ReadFull(res, data); err != nil {
+			return 0, false, nil, err
+		}
+	}
+
+	return readResp.Count, readResp.EOF != 0, data, nil
+}
+
+func TestReadEOF(t *testing.T) {
+	if testing.Verbose() {
+		util.DefaultLogger.SetDebug(true)
+	}
+
+	listener, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mem := memfs.New()
+
+	// Create a 64KB file with random content.
+	const fileSize = 64 * 1024
+	fileData := make([]byte, fileSize)
+	if _, err := rand.Read(fileData); err != nil {
+		t.Fatal(err)
+	}
+	f, err := mem.Create("/testfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(fileData); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	handler := helpers.NewNullAuthHandler(mem)
+	cacheHelper := helpers.NewCachingHandler(handler, 1024)
+	go func() {
+		_ = nfs.Serve(listener, cacheHelper)
+	}()
+
+	c, err := rpc.DialTCP(listener.Addr().Network(), listener.Addr().(*net.TCPAddr).String(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	var mounter nfsc.Mount
+	mounter.Client = c
+	target, err := mounter.Mount("/", rpc.AuthNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = mounter.Unmount()
+	}()
+
+	// Small mid-file read: should NOT set EOF
+	cnt, eof, data, err := nfsRead(target, "/testfile", 0, 16*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 16*1024 {
+		t.Fatalf("small mid-file read: expected count %d, got %d", 16*1024, cnt)
+	}
+	if eof {
+		t.Fatal("small mid-file read: EOF should not be set")
+	}
+	if !bytes.Equal(data, fileData[:16*1024]) {
+		t.Fatal("small mid-file read: data mismatch")
+	}
+
+	// Small read that reaches exactly EOF: should set EOF
+	cnt, eof, data, err = nfsRead(target, "/testfile", 48*1024, 16*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 16*1024 {
+		t.Fatalf("small end-of-file read: expected count %d, got %d", 16*1024, cnt)
+	}
+	if !eof {
+		t.Fatal("small end-of-file read: EOF should be set")
+	}
+	if !bytes.Equal(data, fileData[48*1024:]) {
+		t.Fatal("small end-of-file read: data mismatch")
+	}
+
+	// Large mid-file read: should NOT set EOF
+	cnt, eof, data, err = nfsRead(target, "/testfile", 0, 40*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 40*1024 {
+		t.Fatalf("mid-file read: expected count %d, got %d", 40*1024, cnt)
+	}
+	if eof {
+		t.Fatal("mid-file read: EOF should not be set")
+	}
+	if !bytes.Equal(data, fileData[:40*1024]) {
+		t.Fatal("mid-file read: data mismatch")
+	}
+
+	// Read that reaches exactly the end of file (offset+count == filesize): should set EOF
+	cnt, eof, data, err = nfsRead(target, "/testfile", 24*1024, 40*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 40*1024 {
+		t.Fatalf("end-of-file read: expected count %d, got %d", 40*1024, cnt)
+	}
+	if !eof {
+		t.Fatal("end-of-file read: EOF should be set")
+	}
+	if !bytes.Equal(data, fileData[24*1024:]) {
+		t.Fatal("end-of-file read: data mismatch")
+	}
+
+	// Read that extends past EOF (count > remaining): should set EOF with trimmed count
+	cnt, eof, data, err = nfsRead(target, "/testfile", 60*1024, 40*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 4*1024 {
+		t.Fatalf("past-EOF read: expected count %d, got %d", 4*1024, cnt)
+	}
+	if !eof {
+		t.Fatal("past-EOF read: EOF should be set")
+	}
+	if !bytes.Equal(data, fileData[60*1024:]) {
+		t.Fatal("past-EOF read: data mismatch")
+	}
+
+	// Read at offset == filesize: should set EOF with count=0
+	cnt, eof, _, err = nfsRead(target, "/testfile", fileSize, 40*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 0 {
+		t.Fatalf("at-EOF read: expected count 0, got %d", cnt)
+	}
+	if !eof {
+		t.Fatal("at-EOF read: EOF should be set")
+	}
 }
