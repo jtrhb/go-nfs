@@ -34,14 +34,15 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		}
 		attrs = sattr
 	} else if how == createModeExclusive {
-		// read createverf3
+		// read createverf3 (must consume from wire even if unused)
 		var verf [8]byte
 		if err := xdr.Read(w.req.Body, &verf); err != nil {
 			return &NFSStatusError{NFSStatusInval, err}
 		}
-		Log.Errorf("failing create to indicate lack of support for 'exclusive' mode.")
-		// TODO: support 'exclusive' mode.
-		return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
+		// Treat exclusive as unchecked — macOS Finder uses exclusive mode for
+		// .DS_Store and other metadata files. Without this, Finder shows errors.
+		Log.Debugf("exclusive create mode downgraded to unchecked")
+		attrs = &SetFileAttributes{}
 	} else {
 		// invalid
 		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
